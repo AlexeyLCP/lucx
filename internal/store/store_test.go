@@ -38,6 +38,20 @@ func TestServerCRUD(t *testing.T) {
 		t.Errorf("len = %d, want 1", len(servers))
 	}
 
+	if err := s.UpdateServerStatus("test-1", "online"); err != nil {
+		t.Fatalf("UpdateServerStatus: %v", err)
+	}
+	got, err = s.GetServer("test-1")
+	if err != nil {
+		t.Fatalf("GetServer after update: %v", err)
+	}
+	if got.Status != "online" {
+		t.Errorf("status = %q, want %q", got.Status, "online")
+	}
+	if got.LastSeen == nil {
+		t.Error("last_seen should be set after update")
+	}
+
 	if err := s.DeleteServer("test-1"); err != nil {
 		t.Fatalf("DeleteServer: %v", err)
 	}

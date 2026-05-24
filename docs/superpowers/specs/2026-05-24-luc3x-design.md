@@ -26,9 +26,58 @@ A 3-hop chain requires 6-8 sequential operations across 3 servers (inbounds, out
 
 Go Core provides:
 - **Transactional orchestration** — all-or-nothing chain application with rollback.
-- **Single binary** — deploy on laptop, one of the servers, or Raspberry Pi.
-- **SSH multiplexing** — single persistent connection per server, reused across operations.
+- **Single binary** — deploy anywhere: laptop, server, OpenWrt router, Keenetic.
+- **On-demand SSH** — connect only during operations or manual refresh. No persistent connections.
 - **Pre-flight safety checks** — detect existing services, prevent damage, import existing configs.
+
+### Deployment Modes
+
+LucX Core runs in three modes, selected by CLI flag and resource auto-detection:
+
+| Mode | Target | RAM | CPU | Storage | SSH | Monitor |
+|------|--------|-----|-----|---------|-----|---------|
+| **Desktop** | Laptop/PC | 50+ MB | Any | Any | On-demand | Every 2h |
+| **Server** | VPS/Dedicated | 30+ MB | Any | 20 MB | On-demand | Every 2h |
+| **Router** | OpenWrt / Keenetic | 15 MB target | MIPS/ARM, slow | 8 MB binary | On-demand | Disabled |
+
+#### Resource Strategy
+
+1. **On-demand SSH** — SSH connections are NEVER persistent. Connect → execute operation → disconnect. No idle connections consuming memory.
+
+2. **Rare background refresh** — server status is checked every 2-4 hours (configurable). No constant polling. Default: 3h.
+
+3. **Full refresh on client connect** — when Flutter client opens, Core does a full scan of all servers (status, inbounds, outbounds). This is the primary refresh trigger.
+
+4. **No traffic monitoring** — Core does not continuously poll traffic stats. Traffic data is fetched only when user explicitly requests it in the UI.
+
+#### Router Mode Optimizations
+
+1. **Pure-Go SQLite** — `modernc.org/sqlite` instead of `mattn/go-sqlite3`. No CGo = trivial cross-compilation to MIPS/ARM. No libc dependency = works on musl (OpenWrt).
+
+2. **Reduced binary size** — `-ldflags="-s -w"` + UPX compression. Target: <8 MB.
+
+3. **Memory cap** — configurable Go GC (`GOGC=50`, `GOMEMLIMIT=32MiB`).
+
+4. **Headless by design** — Core is a REST+WebSocket server. No GUI dependency.
+
+5. **No background monitor** — in Router mode, monitor is completely disabled. Status only on explicit refresh.
+
+6. **Config file preferred over gRPC** — on routers, avoid gRPC dependency if Xray gRPC port is not accessible. Fallback to config.json write + SIGHUP.
+
+7. **Comfortable on 128-512 MB RAM** — Core process targets <20 MB RSS. Remaining RAM for OS and Xray.
+
+#### Build Targets
+
+```bash
+GOOS=linux GOARCH=amd64   # Servers, desktops, WSL
+GOOS=linux GOARCH=arm64   # ARM routers (RPi, newer OpenWrt)
+GOOS=linux GOARCH=mipsle  # MIPS routers (older OpenWrt, Keenetic)
+GOOS=linux GOARCH=arm GOARM=7  # ARMv7 routers
+GOOS=darwin GOARCH=amd64  # macOS (dev/testing)
+GOOS=windows GOARCH=amd64 # Windows (dev/testing)
+```
+
+CI produces 5 Linux binaries per release. All compiled with CGO_ENABLED=0 (pure Go SQLite).
 
 ## 3. System Architecture
 
@@ -42,25 +91,20 @@ Go Core provides:
      └─────────────┼─────────────┘
                    │ REST (JWT) + WebSocket
               ┌────┴────┐
-              │ LucX    │   Go Binary (~12MB)
-              │ Core    │   SQLite (WAL) — servers, chains
+              │ LucX    │   Go Binary (~12MB desktop, ~8MB router)
+              │ Core    │   Pure-Go SQLite (modernc.org/sqlite)
               └────┬────┘
                    │ SSH + gRPC (or config file)
-     ┌─────────────┼─────────────┐
-┌────┴────┐  ┌────┴────┐  ┌────┴────┐
-│ Server  │  │ Server  │  │ Server  │   Xray-core on each
-│Finland  │  │ Netherl │  │ Germany │   (installed by LucX
-│(Entry)  │  │ (Hop)   │  │ (Exit)  │    or pre-existing)
-└─────────┘  └─────────┘  └─────────┘
+     ┌─────────────┼─────────────────────┐
+     │             │                     │
+┌────┴────┐  ┌────┴────┐  ┌──────┐  ┌──────────┐
+│ Server  │  │ Server  │  │Router│  │  Router   │
+│(Entry)  │  │ (Exit)  │  │OpenWrt│  │ Keenetic  │
+│ Xray    │  │ Xray    │  │ Xray  │  │  Xray     │
+└─────────┘  └─────────┘  └──────┘  └──────────┘
 ```
 
-### Deployment Modes
-
-| Mode | Core Location | Typical Use |
-|------|--------------|-------------|
-| Local | Same machine as Flutter desktop app | Primary: laptop with GUI |
-| Server-side | One of the proxy servers | Web access, mobile clients |
-| Dedicated | Raspberry Pi / small VPS | 24/7 monitoring |
+**Core itself can run on any of these nodes** — including the router. Typically: Core on laptop (Desktop mode) or Core on router (Router mode, headless, Flutter connects remotely).
 
 ## 4. Protocol Abstraction Layer
 
@@ -188,8 +232,8 @@ github.com/alexeylcp/lucx-core/
 │   │   ├── xray/                   # Xray backend (v1)
 │   │   │   ├── backend.go          # XrayBackend struct, implements ProxyBackend
 │   │   │   ├── grpc.go             # gRPC HandlerService client
-│   │   │   ├── configfile.go       # config.json reader/writer (fallback)
-│   │   │   ├── installer.go        # Download binary, create systemd unit
+│   │   │   ├── configfile.go       # config.json reader/writer (fallback — used in Router mode)
+│   │   │   ├── installer.go        # Download binary, create systemd/init.d unit
 │   │   │   └── config_gen.go       # BuildClientConfig: vless:// link generation
 │   │   ├── awg/                    # AWG backend (v2, stub in v1)
 │   │   ├── singbox/                # Sing-box backend (v2, stub in v1)
@@ -209,18 +253,46 @@ github.com/alexeylcp/lucx-core/
 │   │   └── detector.go             # Detect: what proxy software is running?
 │   │
 │   ├── ssh/                        # SSH client pool (multi-distro)
-│   │   ├── pool.go                 # Connection pool — one persistent conn per server
+│   │   ├── pool.go                 # Connection pool — size varies by mode
 │   │   ├── client.go               # SSH client wrapper (run commands, read/write files)
 │   │   ├── keys.go                 # SSH key management (encrypted storage + ssh-agent)
-│   │   └── distro.go               # OS detection: Debian/Ubuntu/Alma/Arch, pkg manager, init system
+│   │   └── distro.go               # OS detection: Debian/Ubuntu/Alma/Arch/OpenWrt/Keenetic
 │   │
-│   ├── store/                      # SQLite data layer
-│   │   ├── db.go                   # Connection, migrations, WAL mode
+│   ├── store/                      # Pure-Go SQLite data layer (no CGo)
+│   │   ├── db.go                   # modernc.org/sqlite, WAL mode, migrations
 │   │   ├── servers.go              # Server CRUD
 │   │   └── chains.go               # Chain + chain_nodes CRUD
 │   │
+│   ├── mode/                       # Deployment mode management
+│   │   └── mode.go                 # Desktop/Server/Router mode, resource limits, feature flags
+│   │
 │   └── config/                     # Core configuration
 │       └── config.go               # CLI flags, env vars, config file
+```
+
+### Mode Package
+
+```go
+// internal/mode/mode.go
+type RunMode string
+const (
+    ModeDesktop RunMode = "desktop" // full features, default
+    ModeServer  RunMode = "server"  // headless, medium resources
+    ModeRouter  RunMode = "router"  // headless, minimal resources
+)
+
+type ModeConfig struct {
+    RunMode        RunMode
+    MaxSSHPool     int   // desktop: 10, server: 5, router: 1
+    MonitorEnabled bool  // desktop: true, server: true, router: false
+    GOMEMLIMIT     string // desktop: "", server: "64MiB", router: "32MiB"
+    GOGC           int    // desktop: 100, server: 50, router: 50
+}
+
+func DetectMode() RunMode {
+    // Auto-detect: check /proc/cpuinfo, memory, etc.
+    // Override via --mode flag
+}
 ```
 
 ## 7. Data Models
@@ -423,6 +495,8 @@ Before installing Xray on a server, shows:
 
 ## 12. Platform Support
 
+### Client Platforms (Flutter)
+
 | Platform | v1 |
 |----------|-----|
 | Linux Desktop | ✓ Primary |
@@ -431,6 +505,17 @@ Before installing Xray on a server, shows:
 | Android | ✓ (wizard mode for chain builder) |
 | iOS | ✓ (wizard mode for chain builder) |
 | Web (PWA) | ✓ |
+
+### Core Deployment Targets (Go — Linux only)
+
+| Target | Arch | Use |
+|--------|------|-----|
+| linux/amd64 | x86_64 | Servers, desktops, WSL |
+| linux/arm64 | ARM64 | ARM routers (RPi 4/5), newer OpenWrt, ARM VPS |
+| linux/mipsle | MIPS32LE | Older OpenWrt routers, some Keenetic models |
+| linux/arm (GOARM=7) | ARMv7 | Older ARM routers, older Keenetic models |
+
+All builds: `CGO_ENABLED=0` (pure-Go SQLite, no libc dependency — compatible with musl/OpenWrt).
 
 ## 13. Risks & Mitigations
 
@@ -482,8 +567,12 @@ Before installing Xray on a server, shows:
 - Routing rule editor (explicit routing between hops)
 - Chain status monitoring (broken chain detection)
 - Flutter Web (PWA)
+- **Router Mode:** pure-Go SQLite, MIPS/ARM builds, UPX compression, resource limits
+- **Headless mode:** Core runs without Flutter, manageable via REST API
+- **OpenWrt/Keenetic:** init.d scripts, opkg/entware packaging
+- **Multi-distro SSH installer:** OpenWrt (opkg), Keenetic (entware), in addition to apt/dnf/pacman
 
-**Deliverable:** Full-featured personal orchestrator for Xray multi-hop chains.
+**Deliverable:** Full-featured personal orchestrator for Xray multi-hop chains, deployable on routers.
 
 ### Phase 3 — v2 (future)
 
@@ -499,9 +588,11 @@ Before installing Xray on a server, shows:
 
 | Layer | Technology |
 |-------|-----------|
-| Backend Core | Go 1.23+, chi router, mattn/go-sqlite3, golang-jwt, golang.org/x/crypto |
+| Backend Core | Go 1.23+, chi router, modernc.org/sqlite (pure-Go, no CGo), golang-jwt, golang.org/x/crypto |
 | Frontend (all platforms) | Flutter 3.x, drift (SQLite cache), riverpod |
-| Xray config API | gRPC (HandlerService) → fallback: config.json |
+| Xray config API | gRPC (HandlerService) → fallback: config.json write + SIGHUP |
 | SSH | golang.org/x/crypto/ssh |
 | Communication | REST (JSON) + WebSocket |
 | Encryption | AES-256-GCM, Argon2id |
+| Cross-compilation | CGO_ENABLED=0, GOOS=linux, GOARCH=amd64/arm64/mipsle/arm |
+| Binary compression | UPX (router builds), -ldflags="-s -w" |

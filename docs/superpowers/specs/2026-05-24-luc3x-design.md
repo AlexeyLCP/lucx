@@ -1,365 +1,483 @@
-# Luc3X — Design Specification
+# LucX — Design Specification
 
 **Status:** Approved
 **Date:** 2026-05-24
-**Project:** Luc3X — Cross-platform 3x-UI Orchestrator
+**Project:** LucX — Personal Cross-Platform Multi-Hop Proxy Orchestrator
 
 ## 1. Overview
 
-Luc3X is a cross-platform application for orchestrating multiple 3x-UI (Xray-core) panels. It provides a visual chain builder for multi-hop proxy configurations, centralized monitoring, and batch user management — all via the official 3x-UI REST API.
+LucX is a personal tool for visually constructing multi-hop proxy chains and generating client configurations. It installs and configures Xray-core directly on servers via SSH. No multi-user system, no billing, no traffic accounting — just chain building and config export for the owner.
 
 ### Key Principles
 
-- **Zero Trust:** Panel credentials encrypted (AES-256-GCM). Master key held by user, never stored on backend.
-- **Transactions:** Every chain operation is a transaction: pre-flight → execute → commit or rollback.
-- **Offline-First:** Clients cache state locally. Work without Core connectivity, sync when reconnected.
-- **API-Only:** All operations (except initial SSH install) via 3x-UI REST API. No direct config file manipulation.
+- **Personal tool** — single owner, no user/account management.
+- **Zero damage** — never overwrite existing services without explicit confirmation. Detect and import existing Xray installations.
+- **Protocol-agnostic** — architecture abstracts proxy backends behind a single interface. v1 = Xray, v2 = AWG, Hysteria2, Sing-box, TUIC.
+- **Transactions** — chain application is atomic. Pre-flight → execute → commit or full rollback.
+- **gRPC-first** — Xray configuration via gRPC HandlerService. Config file as fallback only.
 
 ## 2. Architecture Decision
 
-**Chosen: Flutter Client + Go Backend Core**
+**Chosen: Go Backend Core + Flutter Client**
 
-### Why Go Backend
+### Why Go Core (even for a personal tool)
 
-- **Transactional chains** — multi-hop setup requires 5+ sequential API calls across panels; Go server guarantees consistency with rollback on failure.
-- **Single binary** — compiles to one ~10MB file, deploy alongside 3x-UI on any server.
-- **24/7 monitoring** — background traffic collection, alerting (webhook/push) even when clients are offline.
-- **Single source of truth** — all clients (mobile, desktop, web) stay synchronized.
+A 3-hop chain requires 6-8 sequential operations across 3 servers (inbounds, outbounds, routing on each). If executed from a Flutter client and the network drops mid-chain, servers are left in an inconsistent state — some configured, some not, no way to rollback.
 
-### Why Flutter Client
-
-- True cross-platform: Android, iOS, Windows, macOS, Linux, Web (PWA) from single codebase.
-- Mature canvas/drawing support for topology graph and chain builder.
-- SQLite via `drift` for local cache.
+Go Core provides:
+- **Transactional orchestration** — all-or-nothing chain application with rollback.
+- **Single binary** — deploy on laptop, one of the servers, or Raspberry Pi.
+- **SSH multiplexing** — single persistent connection per server, reused across operations.
+- **Pre-flight safety checks** — detect existing services, prevent damage, import existing configs.
 
 ## 3. System Architecture
 
 ```
 ┌──────────┐  ┌──────────┐  ┌──────────┐
-│  Mobile  │  │ Desktop  │  │   Web    │   Flutter Clients
-│ (iOS/And)│  │(Win/Mac/ │  │  (PWA)   │   + local SQLite cache
-│          │  │  Linux)  │  │          │
+│ Desktop  │  │  Mobile  │  │   Web    │   Flutter (single codebase)
+│(Win/Mac/ │  │(iOS/And) │  │  (PWA)   │   + local SQLite cache
+│  Linux)  │  │          │  │          │
 └────┬─────┘  └────┬─────┘  └────┬─────┘
      │             │             │
      └─────────────┼─────────────┘
                    │ REST (JWT) + WebSocket
               ┌────┴────┐
-              │ Luc3X   │   Go Binary (~10MB)
-              │ Core    │   SQLite (WAL) + Encrypted Vault
+              │ LucX    │   Go Binary (~12MB)
+              │ Core    │   SQLite (WAL) — servers, chains
               └────┬────┘
-                   │ REST API (3x-UI panels)
+                   │ SSH + gRPC (or config file)
      ┌─────────────┼─────────────┐
 ┌────┴────┐  ┌────┴────┐  ┌────┴────┐
-│ Panel A │  │ Panel B │  │ Panel C │   3x-UI Instances
-│ (Main)  │  │ (Hop)   │  │ (Exit)  │   Xray-core inside
+│ Server  │  │ Server  │  │ Server  │   Xray-core on each
+│Finland  │  │ Netherl │  │ Germany │   (installed by LucX
+│(Entry)  │  │ (Hop)   │  │ (Exit)  │    or pre-existing)
 └─────────┘  └─────────┘  └─────────┘
 ```
 
-## 4. Go Backend Core Structure
+### Deployment Modes
+
+| Mode | Core Location | Typical Use |
+|------|--------------|-------------|
+| Local | Same machine as Flutter desktop app | Primary: laptop with GUI |
+| Server-side | One of the proxy servers | Web access, mobile clients |
+| Dedicated | Raspberry Pi / small VPS | 24/7 monitoring |
+
+## 4. Protocol Abstraction Layer
+
+### ProxyBackend Interface
+
+```go
+// internal/backend/interface.go
+type ProxyBackend interface {
+    // Identity
+    Type() BackendType  // "xray", "awg", "sing-box", "hysteria2", "tuic"
+
+    // Lifecycle (via SSH)
+    Install(ctx, ssh) (string, error)       // download binary, create systemd unit, return binary path
+    Start(ctx, ssh) error
+    Stop(ctx, ssh) error
+    Status(ctx, ssh) (BackendStatus, error) // running/stopped/error + version + PID
+
+    // Configuration — backend chooses gRPC, REST, or config-file internally
+    AddInbound(ctx, ssh, InboundSpec) (InboundResult, error)
+    RemoveInbound(ctx, ssh, tag string) error
+    AddOutbound(ctx, ssh, OutboundSpec) (OutboundResult, error)
+    RemoveOutbound(ctx, ssh, tag string) error
+    SetRouting(ctx, ssh, rules []RoutingRule) error
+    GetConfig(ctx, ssh) (RawConfig, error)  // full current config for import/scan
+
+    // Client config export
+    BuildClientConfig(ctx, ssh, inboundTag string) (string, error)
+    // Returns vless://... or equivalent for the owner
+}
+```
+
+### XrayBackend (v1): gRPC-first with fallback
 
 ```
-github.com/alexeylcp/luc3x-core/
-├── cmd/luc3x-core/main.go       # entry point, flags, graceful shutdown
+┌─────────────────────────────┐
+│        XrayBackend          │
+│                             │
+│  ┌───────────────────────┐  │
+│  │ XrayGRPC (priority)   │  │  HandlerService.AddInbound
+│  │ gRPC HandlerService   │──┤  .AddOutbound .RemoveInbound
+│  │ (no restart needed)   │  │
+│  └───────────────────────┘  │
+│             │               │
+│             │ fallback       │
+│  ┌───────────────────────┐  │
+│  │ XrayConfigFile         │  │  read config.json → modify →
+│  │ (requires restart)     │  │  write → restart Xray
+│  └───────────────────────┘  │
+└─────────────────────────────┘
+```
+
+Auto-detect at Install: try gRPC → if unavailable, use config file. gRPC port configured in systemd unit (--format=json on :10085 by default).
+
+### Plugin Registry
+
+```go
+// internal/backend/registry.go
+var Backends = map[BackendType]func() ProxyBackend{
+    "xray":      func() ProxyBackend { return &xray.XrayBackend{} },       // v1
+    "awg":       func() ProxyBackend { return &awg.AWGBackend{} },         // v2
+    "sing-box":  func() ProxyBackend { return &singbox.SingBoxBackend{} }, // v2
+    "hysteria2": func() ProxyBackend { return &hysteria2.H2Backend{} },    // v2
+    "tuic":      func() ProxyBackend { return &tuic.TUICBackend{} },       // v2
+}
+```
+
+Chain Engine never imports a concrete backend. It only uses `ProxyBackend` interface.
+
+## 5. Server Safety — Pre-Install Scan & Import
+
+### Pre-Install Safety Check
+
+Before installing Xray on a new server, LucX MUST scan for existing services:
+
+```
+PreInstallCheck(ssh):
+  1. Port scan: check common proxy ports (443, 8443, 10085, etc.)
+  2. Service scan: detect systemd units matching *xray*, *3x-ui*, *x-ui*, *sing-box*, *awg*
+  3. Process scan: detect running binaries (xray, sing-box, amneziawg, hysteria)
+  4. Binary scan: check /usr/local/bin/, /opt/ for known proxy binaries
+  5. Config scan: check /usr/local/etc/xray/, /etc/sing-box/, /etc/amnezia/
+```
+
+### Decision Matrix
+
+| Detection | Action |
+|-----------|--------|
+| Nothing found | Safe to install Xray |
+| Known: standalone Xray (no 3x-UI) | **Import mode** — read config.json, import inbounds/outbounds/routing into LucX model. Do NOT overwrite. |
+| Known: Xray behind 3x-UI | Warn user. LucX cannot manage 3x-UI-managed Xray. Suggest manual migration. |
+| Known: Other proxy (Sing-box, AWG) | Warn user. Mark for future import (v2). Do NOT install over it. |
+| Unknown service on port 443/8443 | Warn user. Require explicit confirmation to proceed. |
+
+### Import Flow (standalone Xray detected)
+
+```
+1. Detect: systemd unit "xray.service" exists, no "x-ui" service
+2. Read: /usr/local/etc/xray/config.json via SSH
+3. Parse: extract all inbounds, outbounds, routing rules
+4. Present: show user what was found, ask to import
+5. Import: create server entry in LucX DB, populate inbounds/outbounds as read-only snapshot
+6. Mark: server status = 'imported', backend = 'xray', config_managed = true
+```
+
+After import, the server is "adopted" — LucX can now manage it (add/remove inbounds, etc.) without reinstalling.
+
+## 6. Go Backend Core Structure
+
+```
+github.com/alexeylcp/lucx-core/
+├── cmd/lucx-core/main.go           # entry point, flags, graceful shutdown
 ├── internal/
-│   ├── api/                     # HTTP handlers (chi) + WebSocket hub
-│   │   ├── auth.go              # JWT issue/refresh/revoke
-│   │   ├── panels.go            # CRUD panels, test connection
-│   │   ├── chains.go            # Chain CRUD + apply/validate
-│   │   ├── inbounds.go          # Proxy to panel APIs
-│   │   ├── users.go             # Batch user operations
-│   │   └── ws.go                # WebSocket events (traffic, alerts)
-│   ├── panel/                   # 3x-UI API client
-│   │   ├── client.go            # HTTP client, auth, retry, circuit breaker
-│   │   ├── inbound.go           # /panel/api/inbound/*
-│   │   ├── outbound.go          # /panel/api/outbound/* (when available)
-│   │   ├── user.go              # /panel/api/inbound/client*
-│   │   └── xray.go              # /panel/api/xray/* (status)
-│   ├── chain/                   # Chain engine (core feature)
-│   │   ├── engine.go            # Orchestrator: pre-flight→execute→commit/rollback
-│   │   ├── planner.go           # Builds execution plan from chain graph
-│   │   ├── executor.go          # Executes plan sequentially
-│   │   ├── validator.go         # Pre-flight: connectivity, tag conflicts
-│   │   └── rollback.go          # Undo created resources on failure
-│   ├── sync/                    # Panel state sync (in-memory, not persisted)
-│   │   ├── scanner.go           # Scans inbounds/outbounds/routing from panels
-│   │   ├── diff.go              # Diffs current vs previous snapshot
-│   │   ├── mapper.go            # Builds connection graph
-│   │   └── cache.go             # In-memory TTL cache for users + snapshots
-│   ├── monitor/                 # Background monitoring
-│   │   ├── collector.go         # Periodic traffic collection
-│   │   ├── alerter.go           # Rules: limit, expiration, offline
-│   │   └── push.go              # Webhook / FCM push notifications
-│   ├── vault/                   # Encrypted credential storage
-│   │   └── vault.go             # AES-256-GCM, key derivation
-│   ├── store/                   # Data layer (SQLite — only own state)
-│   │   ├── db.go                # Connection, migrations, WAL mode
-│   │   ├── panels.go            # Panel CRUD queries
-│   │   ├── chains.go            # Chain + chain_nodes queries
-│   │   └── audit.go             # Audit log queries
-│   └── ssh/                     # Auto-install 3x-UI
-│       └── installer.go         # SSH + curl install.sh + verify API
+│   ├── api/                        # HTTP handlers (chi router) + WebSocket
+│   │   ├── router.go               # chi setup, middleware chain
+│   │   ├── auth.go                 # simple JWT (single user, local auth)
+│   │   ├── servers.go              # CRUD servers, SSH install, import
+│   │   ├── chains.go               # Chain CRUD + apply/validate/rollback
+│   │   ├── map.go                  # Topology map endpoint
+│   │   └── ws.go                   # WebSocket events (status, logs)
+│   │
+│   ├── backend/                    # Protocol abstraction layer
+│   │   ├── interface.go            # ProxyBackend interface + shared types
+│   │   ├── registry.go             # Backend registry map
+│   │   ├── types.go                # InboundSpec, OutboundSpec, RoutingRule, BackendStatus
+│   │   ├── xray/                   # Xray backend (v1)
+│   │   │   ├── backend.go          # XrayBackend struct, implements ProxyBackend
+│   │   │   ├── grpc.go             # gRPC HandlerService client
+│   │   │   ├── configfile.go       # config.json reader/writer (fallback)
+│   │   │   ├── installer.go        # Download binary, create systemd unit
+│   │   │   └── config_gen.go       # BuildClientConfig: vless:// link generation
+│   │   ├── awg/                    # AWG backend (v2, stub in v1)
+│   │   ├── singbox/                # Sing-box backend (v2, stub in v1)
+│   │   ├── hysteria2/              # Hysteria2 backend (v2, stub in v1)
+│   │   └── tuic/                   # TUIC backend (v2, stub in v1)
+│   │
+│   ├── chain/                      # Transactional chain engine
+│   │   ├── engine.go               # Apply(chain) — orchestrates full flow
+│   │   ├── planner.go              # Builds execution plan from chain graph
+│   │   ├── executor.go             # Executes plan, collects created resources
+│   │   ├── validator.go            # Pre-flight: SSH + gRPC + tag/port conflicts
+│   │   └── rollback.go             # Undo created resources in reverse order
+│   │
+│   ├── scanner/                    # Server safety scanner
+│   │   ├── preflight.go            # PreInstallCheck — ports, services, processes
+│   │   ├── importer.go             # Import existing Xray config into LucX model
+│   │   └── detector.go             # Detect: what proxy software is running?
+│   │
+│   ├── ssh/                        # SSH client pool
+│   │   ├── pool.go                 # Connection pool — one persistent conn per server
+│   │   ├── client.go               # SSH client wrapper (run commands, read/write files)
+│   │   └── keys.go                 # SSH key management (encrypted storage)
+│   │
+│   ├── store/                      # SQLite data layer
+│   │   ├── db.go                   # Connection, migrations, WAL mode
+│   │   ├── servers.go              # Server CRUD
+│   │   └── chains.go               # Chain + chain_nodes CRUD
+│   │
+│   └── config/                     # Core configuration
+│       └── config.go               # CLI flags, env vars, config file
 ```
 
-## 5. Data Models
+## 7. Data Models
 
-**Persisted in SQLite (4 tables):** panels, chains, chain_nodes, audit_log — это собственные данные оркестратора.
-**In-memory cache (TTL):** users, snapshots — источник правды это панели, перезапрашиваются при каждом подключении.
-
-### panels
+### servers
 | Column | Type | Description |
 |--------|------|-------------|
 | id | TEXT PK | UUID |
-| name | TEXT NOT NULL | "Amsterdam-Main" |
-| url | TEXT NOT NULL | "https://1.2.3.4:2053" |
-| username | TEXT NOT NULL | Encrypted (vault) |
-| password | TEXT NOT NULL | Encrypted (vault) |
-| role | TEXT DEFAULT 'slave' | 'master' or 'slave' |
-| status | TEXT DEFAULT 'unknown' | 'online', 'offline', 'degraded', 'unknown' |
-| tags | TEXT DEFAULT '[]' | JSON array: ["eu", "reality", "10gbit"] |
-| xray_version | TEXT | Xray version string |
-| last_seen | DATETIME | Last successful API contact |
-| created_at | DATETIME | DEFAULT NOW() |
+| name | TEXT NOT NULL | "Finland-Helsinki" |
+| host | TEXT NOT NULL | SSH host/IP |
+| port | INTEGER DEFAULT 22 | SSH port |
+| username | TEXT NOT NULL | SSH user (root or sudoer) |
+| auth_method | TEXT NOT NULL | 'password' or 'key' |
+| credential | TEXT NOT NULL | Encrypted: password or private key |
+| os | TEXT | Detected: 'debian12', 'ubuntu24', etc. |
+| arch | TEXT | 'amd64', 'arm64' |
+| status | TEXT DEFAULT 'unknown' | 'online', 'offline', 'imported' |
+| source | TEXT DEFAULT 'fresh' | 'fresh' (LucX installed), 'imported' (pre-existing Xray adopted) |
+| tags | TEXT DEFAULT '[]' | JSON: ["eu", "1gbit", "reality"] |
+| last_seen | DATETIME | |
+| created_at | DATETIME DEFAULT NOW() | |
+
+### server_backends
+| Column | Type | Description |
+|--------|------|-------------|
+| server_id | TEXT FK→servers | |
+| backend_type | TEXT NOT NULL | 'xray', 'awg', etc. |
+| version | TEXT | "1.8.23" |
+| status | TEXT DEFAULT 'stopped' | 'running', 'stopped', 'error' |
+| config_path | TEXT | /usr/local/etc/xray/config.json |
+| api_endpoint | TEXT | gRPC: "localhost:10085" |
+| config_managed | BOOLEAN DEFAULT true | false = imported, don't auto-modify |
+| installed_at | DATETIME | |
+| PK | (server_id, backend_type) | |
 
 ### chains
 | Column | Type | Description |
 |--------|------|-------------|
 | id | TEXT PK | UUID |
-| name | TEXT NOT NULL | "EU-Hop → Finland-Exit" |
-| protocol | TEXT NOT NULL | 'vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria', 'tuic' |
-| transport | TEXT DEFAULT 'tcp' | 'tcp', 'ws', 'grpc', 'h2', 'quic' |
-| security | TEXT DEFAULT 'reality' | 'none', 'tls', 'reality' |
+| name | TEXT NOT NULL | "FI → NL → DE" |
 | status | TEXT DEFAULT 'draft' | 'draft', 'active', 'broken', 'rolling_back' |
-| applied_at | DATETIME | When the chain was last applied |
-| created_at | DATETIME | DEFAULT NOW() |
+| applied_at | DATETIME | |
+| created_at | DATETIME DEFAULT NOW() | |
 
 ### chain_nodes
 | Column | Type | Description |
 |--------|------|-------------|
 | chain_id | TEXT FK→chains | |
-| panel_id | TEXT FK→panels | |
-| position | INTEGER | 0=entry, N=intermediate, last=exit |
-| inbound_tag | TEXT | Tag of inbound created on this node |
-| outbound_tag | TEXT | Tag of outbound routing to next node |
-| config_snapshot | TEXT | JSON — what was created (for rollback) |
-| PK | (chain_id, panel_id, position) | |
+| server_id | TEXT FK→servers | |
+| backend_type | TEXT NOT NULL | 'xray' (v1), can be mixed in v2 |
+| position | INTEGER NOT NULL | 0=entry, N=intermediate, last=exit |
+| role | TEXT NOT NULL | 'entry', 'hop', 'exit' |
+| inbound_spec | TEXT | JSON: InboundSpec (what to create) |
+| outbound_spec | TEXT | JSON: OutboundSpec (route to next node, nil for exit) |
+| inbound_result | TEXT | JSON: created inbound details (for rollback) |
+| outbound_result | TEXT | JSON: created outbound details (for rollback) |
+| PK | (chain_id, position) | |
 
-### users — in-memory cache (NOT persisted)
+### InboundSpec / OutboundSpec (Go types, serialized to JSON in chain_nodes)
 
-Fetched fresh from panels on every connection. Held in memory with TTL. Panels are the source of truth.
+```go
+type InboundSpec struct {
+    Tag      string // unique tag, e.g. "chain-xxx-entry"
+    Protocol string // "vless", "vmess", "trojan"
+    Port     int    // 443
+    Listen   string // "0.0.0.0"
+    Settings json.RawMessage
+    StreamSettings *StreamSettings
+}
 
-| Field | Type | Description |
-|-------|------|-------------|
-| id | string | "panel_id:inbound_id:email" |
-| panel_id | string | |
-| inbound_id | int | Inbound ID on the panel |
-| email | string | User identifier |
-| uuid | string | Xray UUID |
-| traffic_up | int64 | |
-| traffic_down | int64 | |
-| traffic_limit | int64 | Bytes, 0 = unlimited |
-| expire_at | time.Time | Zero = never |
-| status | string | 'active', 'expired', 'disabled', 'over_limit' |
-| chain_id | string | Bound chain, empty if unassigned |
+type OutboundSpec struct {
+    Tag      string // e.g. "chain-xxx-to-nl"
+    Protocol string
+    Settings json.RawMessage
+    StreamSettings *StreamSettings
+    SendThrough *string // outbound IP (optional)
+}
 
-### snapshots — in-memory cache (NOT persisted)
+type RoutingRule struct {
+    Type        string // "field"
+    InboundTag  []string
+    OutboundTag string
+}
 
-Full panel state (inbounds + outbounds + routing) fetched on-demand for map view. Re-fetched when user opens dashboard or triggers refresh. Used to diff and detect changes.
+type StreamSettings struct {
+    Network  string // "tcp", "ws", "grpc", "h2", "quic"
+    Security string // "none", "tls", "reality"
+    // ... protocol-specific fields
+}
+```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| panel_id | string | |
-| data | json.RawMessage | { inbounds, outbounds, routing } |
-| taken_at | time.Time | |
-
-### audit_log
-| Column | Type | Description |
-|--------|------|-------------|
-| id | INTEGER PK | AUTOINCREMENT |
-| actor | TEXT NOT NULL | Client IP or client-id who performed the action |
-| action | TEXT NOT NULL | 'chain.apply', 'user.batch_create', etc. |
-| target_type | TEXT | 'chain', 'user', 'panel' |
-| target_id | TEXT | |
-| details | TEXT | JSON with operation details |
-| status | TEXT NOT NULL | 'success', 'failed', 'rolled_back' |
-| error_msg | TEXT | Error if status=failed |
-| created_at | DATETIME | DEFAULT NOW() |
-
-## 6. Core REST API
+## 8. Core REST API
 
 Base: `/api/v1/`
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | /auth/login | Local login to Core |
-| POST | /auth/unlock | Unlock Vault with master key |
-| CRUD | /panels | Manage panels (add/remove/test) |
-| GET | /panels/:id/inbounds | Proxy: list panel inbounds |
-| GET | /panels/:id/outbounds | Proxy: list panel outbounds |
-| GET | /panels/:id/traffic | Panel traffic (up/down/total) |
+| POST | /auth/login | Simple password auth (single user) |
+| CRUD | /servers | Manage servers |
+| POST | /servers/:id/install | Install Xray via SSH (with pre-flight scan) |
+| POST | /servers/:id/scan | Pre-flight scan: detect existing services |
+| POST | /servers/:id/import | Import existing Xray config |
+| GET | /servers/:id/status | Server + backend status |
 | CRUD | /chains | Create/edit/delete chains |
-| POST | /chains/:id/apply | Apply chain (transactional) |
 | POST | /chains/:id/validate | Pre-flight validation only |
-| POST | /users/batch | Batch user operations |
-| GET | /map | Full connection map (graph JSON) |
-| POST | /ssh/install | Auto-install 3x-UI via SSH |
-| WS | /ws/events | Real-time event stream |
+| POST | /chains/:id/apply | Apply chain (transactional) |
+| POST | /chains/:id/rollback | Rollback an active chain |
+| GET | /chains/:id/config | Get generated client config (vless:// link) |
+| GET | /map | Topology map: servers + chains as graph JSON |
+| WS | /ws/events | Real-time: apply progress, status changes |
 
-## 7. Key Screens
+## 9. Chain Transaction Flow
 
-### 7.1 Spider Web — Dashboard (Main Screen)
-
-Live network topology graph. All servers as nodes, all chains as edges.
-
-- **Node size** = number of active chains through this server
-- **Line thickness** = traffic volume
-- **Animated dots** on lines = live traffic flow
-- **Colors:** green glow = online, red glow = offline, orange border = master, dashed border = pending
-- **Stats overlay:** total servers, chains, users, offline count
-- **Legend:** active chain, intermediate hop, broken
-- Client nodes shown on periphery
-
-### 7.2 Chain Builder
-
-Three-panel layout (desktop):
-
-- **Left sidebar:** Server list with status indicators, drag source
-- **Center canvas:** Graph editor. Drag servers onto canvas, connect with lines. ENTRY → HOP(s) → EXIT. Grid background, + buttons between nodes to insert hops.
-- **Right inspector:** Chain name, protocol selector, transport, security. Validate + Apply buttons.
-
-Mobile: card-based chain list with status indicators, FAB to create new chain. Chain editor is fullscreen wizard.
-
-### 7.3 Connection Map
-
-Auto-scanned graph of actual inbounds/outbounds/routing across all panels. Shows real (not designed) connections. Highlights:
-- Broken chains (offline intermediate node)
-- Orphaned inbounds/outbounds
-- Conflicts (duplicate tags, port conflicts)
-
-### 7.4 Server List / Management
-
-Table/card view of all panels with:
-- Status (online/offline/degraded/last seen)
-- Role (master/slave)
-- Tags for filtering
-- Quick actions: test connection, view inbounds, open web panel
-
-### 7.5 User Management
-
-Batch operations across multiple chains/panels:
-- Mass create/edit/delete users
-- Assign users to chains
-- Traffic monitoring, limits, expiration
-- Bulk export/import (subscription links)
-
-## 8. Chain Transaction Flow
-
-When user clicks "Apply Chain" on a chain like `Finland → Netherlands → Germany (Exit)`:
+### Apply Chain: "Finland → Netherlands → Germany (Exit)"
 
 ```
-1. PRE-FLIGHT
-   - Check all 3 panels online
-   - Validate no tag conflicts
-   - Verify protocol/transport compatibility
+1. PRE-FLIGHT (validator.go)
+   ├─ Check SSH connectivity to all 3 servers
+   ├─ Check backend Status() on all 3 (Xray running?)
+   ├─ Check no existing inbounds with conflicting tags/ports
+   └─ Build execution plan: ordered list of operations
 
-2. EXECUTE (sequential, stops on first error)
-   2a. Finland:   create Outbound → Netherlands (tag: "hop-to-nl")
-   2b. Netherlands: create Inbound (tag: "from-fi")
-                   create Outbound → Germany (tag: "hop-to-de")
-                   create Routing rule: from-fi → hop-to-de
-   2c. Germany:   create Inbound (tag: "exit-de")
-                   create Client (user)
+2. EXECUTE (executor.go, sequential, stops on first error)
+   ├─ Finland: AddInbound (VLESS+Reality, :443, tag="chain-xxx-entry")
+   ├─ Finland: AddOutbound (VLESS, → Netherlands, tag="chain-xxx-to-nl")
+   ├─ Finland: SetRouting (inbound:"chain-xxx-entry" → outbound:"chain-xxx-to-nl")
+   ├─ Netherlands: AddInbound (VLESS, tag="chain-xxx-hop1")
+   ├─ Netherlands: AddOutbound (VLESS, → Germany, tag="chain-xxx-to-de")
+   ├─ Netherlands: SetRouting (inbound:"chain-xxx-hop1" → outbound:"chain-xxx-to-de")
+   └─ Germany: AddInbound (VLESS+Reality, tag="chain-xxx-exit")
 
 3. COMMIT
-   - Save config_snapshot JSON to each chain_node (for rollback)
-   - Update chain status = 'active'
-   - Write audit log
+   ├─ Save chain + chain_nodes to SQLite
+   ├─ Store created inbound/outbound details in chain_nodes (for rollback)
+   └─ chain.status = 'active'
 
-ON ERROR (e.g., step 2b fails):
-   → ROLLBACK: delete Outbound created in 2a from Finland
-   → Update chain status = 'draft'
-   → Write audit log with error_msg
+4. GENERATE CLIENT CONFIG
+   └─ BuildClientConfig on Germany → vless://uuid@germany-ip:443?...
+
+ON ERROR (e.g., Netherlands step fails):
+   → ROLLBACK (reverse order):
+     ├─ Finland: RemoveInbound("chain-xxx-entry")
+     ├─ Finland: RemoveOutbound("chain-xxx-to-nl")
+     └─ chain.status = 'draft'
+   → All servers returned to pre-apply state
 ```
 
-## 9. Security Model
+### Rollback Guarantee
 
-- **Vault:** Panel credentials encrypted with AES-256-GCM. Master key derived from user password via Argon2id.
-- **Unlock flow:** Client sends master key → Core unlocks Vault → key held in memory only, never persisted.
-- **JWT:** Short-lived access tokens (15min) + refresh tokens (7d). Revocable.
-- **TLS:** Core serves HTTPS only (auto-generate self-signed or use provided cert).
-- **Audit:** Every mutation logged to audit_log.
-- **Minimal logging:** No credentials in logs, no request bodies in logs.
+Every Add* operation stores its result before the next operation. On failure, rollback iterates the collected results in reverse and calls the corresponding Remove*.
 
-## 10. Platform Support
+## 10. Key Screens
 
-| Platform | Status | Notes |
-|----------|--------|-------|
-| Linux Desktop | v1 | Primary |
-| macOS Desktop | v1 | |
-| Windows Desktop | v1 | |
-| Android | v1 | |
-| iOS | v1 | |
-| Web (PWA) | v1 | For server-side access |
-| CLI | v2 | Automation/scripting companion |
+### 10.1 Spider Web — Dashboard
 
-## 11. Risks & Mitigations
+Live topology graph. Servers as nodes, chains as edges.
+- Node size = number of chains through server
+- Animated dots on edges = live traffic indication
+- Colors: green=online, red=offline, orange=imported, blue=entry, gray=hop
+- Stats: total servers, active chains
+- Click node → server details. Click edge → chain details.
 
-### CRITICAL: 3x-UI Outbound/Routing API
+### 10.2 Chain Builder (Desktop)
 
-**Risk:** По состоянию на май 2026, API 3x-UI для Outbounds и Routing Rules либо отсутствует, либо сильно ограничен. Inbounds + Clients — зрелые. Но без API для outbounds/routing весь Chain Engine не сможет работать.
+Three-panel layout:
+- **Left:** Server palette — drag sources, grouped by region/tag, status indicator
+- **Center:** Canvas — drag servers, connect lines, ENTRY→HOP→EXIT labels, + button between nodes
+- **Right:** Inspector — chain name, protocol per hop, transport, security. Validate + Apply buttons.
 
-**Mitigation (Phase 0 — FIRST THING):**
-1. Поднять тестовую панель 3x-UI, проверить ВСЕ endpoint'ы: inbound CRUD, outbound CRUD, routing CRUD, client CRUD.
-2. Если outbound/routing API нет — проверить endpoint "Update Xray Config" (если есть — использовать его как fallback для записи конфига напрямую).
-3. Если и его нет — форкнуть 3x-UI и добавить недостающие endpoint'ы, либо внести в上游 PR.
+### 10.3 Chain Builder (Mobile)
 
-**Результат Phase 0:** документ `docs/api-audit.md` с полной картой доступных endpoint'ов и решением по outbound/routing.
+Wizard mode (step-by-step):
+1. Select Entry server → configure inbound (protocol, port, security)
+2. Add Hop? (optional, repeatable) → select server, configure
+3. Select Exit server → configure
+4. Review summary → Apply
 
-### Project Complexity
+### 10.4 Server Management
 
-**Risk:** Go Core + Flutter + WebSocket + Vault + Transaction Engine — это серьёзный объём для одного человека.
+Card/table view. Status, SSH info, installed backends, tags.
+Quick actions: Install Xray, Scan (pre-flight), Import config, Terminal (raw SSH).
 
-**Mitigation — Phased Approach:**
-- **Phase 1 (MVP):** Flutter-only приложение. Прямые вызовы API панелей из клиента. Локальная SQLite (drift) для panels/chains. Никакого Go Core. Транзакции цепочек — optimistic (выполняем последовательно, при ошибке — manual rollback через UI).
-- **Phase 2:** Go Core. Когда продукт показывает жизнь и становится понятно, что Flutter-only недостаточно — выносим оркестрацию в Core.
+### 10.5 Pre-Install Scan Dialog
 
-### Mobile Graph Editor
+Before installing Xray on a server, shows:
+- Detected services/ports
+- Safety assessment: green (safe), yellow (known, importable), red (conflict, needs user decision)
+- Import button if standalone Xray detected
 
-**Risk:** Drag & drop конструктор цепочек на маленьком экране телефона — неудобно.
+## 11. Security Model
 
-**Mitigation:** Два режима конструктора:
-- **Desktop/Tablet:** полноценный граф с drag & drop (canvas).
-- **Mobile:** Wizard mode — шаговый конструктор: "Выбери Entry сервер" → "Выбери протокол" → "Добавить Hop?" → "Выбери Exit сервер" → "Готово".
+- **SSH credentials:** encrypted at rest (AES-256-GCM, key derived from user password via Argon2id).
+- **No credentials in logs:** SSH passwords/keys never written to logs.
+- **JWT:** Simple token auth for Flutter ↔ Core communication. Single user, no roles.
+- **TLS:** Core serves HTTPS. Self-signed cert auto-generated, user can provide custom cert.
+- **SSH pool:** One persistent connection per server, reused. Timeout: 5min idle.
 
-### SSH Installer
+## 12. Platform Support
 
-**Risk:** Разные ОС (Debian/Ubuntu/CentOS/AlmaLinux), firewall (ufw/firewalld/iptables/nftables), SELinux, architecture (amd64/arm64).
+| Platform | v1 |
+|----------|-----|
+| Linux Desktop | ✓ Primary |
+| macOS Desktop | ✓ |
+| Windows Desktop | ✓ |
+| Android | ✓ (wizard mode for chain builder) |
+| iOS | ✓ (wizard mode for chain builder) |
+| Web (PWA) | ✓ |
 
-**Mitigation:**
-- Использовать официальный install.sh от 3x-UI (проверенный).
-- Перед запуском: detect OS + arch, проверить совместимость.
-- После установки: verify API доступен (GET /panel/api/inbounds/list с кредом).
-- При ошибке: сохранить полный лог установки в audit_log.
+## 13. Development Phases
 
-### Other Adjustments
+### Phase 0 — API Verification (1-2 days)
 
-- **Forced refresh:** в snapshot cache добавить кнопку "Refresh Now" + авто-refresh по таймеру (настраиваемый, default 30s).
-- **Audit Log:** добавить поле `actor` — IP/client-id кто выполнил действие.
-- **Concurrent access:** если несколько клиентов подключены к одному Core — блокировка на apply chain (оптимистическая через version field в БД).
+- Deploy test Xray instance, verify gRPC HandlerService API works for AddInbound/AddOutbound/RemoveInbound.
+- Verify config file format compatibility.
+- Document findings in `docs/api-audit.md`.
 
-## 12. Out of Scope for v1
+### Phase 1 — MVP (4-6 weeks)
 
-- **AmneziaWG (AWG) support** — vanilla 3x-UI API only. AWG panel support in v2.
-- **Telemt (MTProto)** — v2.
-- **DPI obfuscation presets** — v2 (depends on AWG).
-- **Subscription link import** — v1 supports URL+login+password; subscription parsing in v2.
-- **Embedded Xray-core** — Luc3X orchestrates, does not proxy traffic itself.
+**Scope:**
+- Go Core: basic HTTP server, SQLite, server CRUD, SSH client pool
+- XrayBackend: gRPC config API, installer (download binary + systemd unit)
+- Chain engine: single-protocol (VLESS+Reality), 2-hop max, transaction with rollback
+- Pre-flight scanner: detect existing services, import standalone Xray config
+- Flutter Desktop: server list, simple chain builder (2 nodes), config export as vless:// link
+- No mobile wizard yet, no spider web, no routing rule management (implicit routing only)
 
-## 13. Tech Stack Summary
+**Deliverable:** Install Xray on 2 servers, create chain between them, get working vless:// link.
+
+### Phase 2 — v1 (6-8 weeks)
+
+**Scope:**
+- Full chain builder: N hops, all Xray protocols (VLESS, VMess, Trojan, Shadowsocks)
+- All transports (TCP, WS, gRPC, H2, QUIC) and security (Reality, TLS)
+- Spider web topology dashboard
+- Mobile wizard mode
+- Routing rule editor (explicit routing between hops)
+- Chain status monitoring (broken chain detection)
+- Flutter Web (PWA)
+
+**Deliverable:** Full-featured personal orchestrator for Xray multi-hop chains.
+
+### Phase 3 — v2 (future)
+
+**Scope:**
+- AWG backend (AmneziaWG)
+- Sing-box backend
+- Hysteria2 backend
+- TUIC backend
+- Mixed-protocol chains (Xray → AWG → Xray)
+- Subscription link import
+
+## 14. Tech Stack
 
 | Layer | Technology |
 |-------|-----------|
-| Backend Core | Go 1.23+, chi router, mattn/go-sqlite3, golang-jwt |
-| Frontend (all platforms) | Flutter 3.x, drift (SQLite), riverpod |
+| Backend Core | Go 1.23+, chi router, mattn/go-sqlite3, golang-jwt, golang.org/x/crypto |
+| Frontend (all platforms) | Flutter 3.x, drift (SQLite cache), riverpod |
+| Xray config API | gRPC (HandlerService) → fallback: config.json |
+| SSH | golang.org/x/crypto/ssh |
 | Communication | REST (JSON) + WebSocket |
 | Encryption | AES-256-GCM, Argon2id |
-| SSH | golang.org/x/crypto/ssh |

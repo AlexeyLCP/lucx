@@ -80,26 +80,30 @@ github.com/alexeylcp/luc3x-core/
 │   │   ├── executor.go          # Executes plan sequentially
 │   │   ├── validator.go         # Pre-flight: connectivity, tag conflicts
 │   │   └── rollback.go          # Undo created resources on failure
-│   ├── sync/                    # Panel state synchronization
-│   │   ├── scanner.go           # Scans inbounds/outbounds/routing
-│   │   ├── diff.go              # Diffs local state vs panel state
-│   │   └── mapper.go            # Builds connection graph
+│   ├── sync/                    # Panel state sync (in-memory, not persisted)
+│   │   ├── scanner.go           # Scans inbounds/outbounds/routing from panels
+│   │   ├── diff.go              # Diffs current vs previous snapshot
+│   │   ├── mapper.go            # Builds connection graph
+│   │   └── cache.go             # In-memory TTL cache for users + snapshots
 │   ├── monitor/                 # Background monitoring
 │   │   ├── collector.go         # Periodic traffic collection
 │   │   ├── alerter.go           # Rules: limit, expiration, offline
 │   │   └── push.go              # Webhook / FCM push notifications
 │   ├── vault/                   # Encrypted credential storage
 │   │   └── vault.go             # AES-256-GCM, key derivation
-│   ├── store/                   # Data layer (SQLite)
+│   ├── store/                   # Data layer (SQLite — only own state)
 │   │   ├── db.go                # Connection, migrations, WAL mode
 │   │   ├── panels.go            # Panel CRUD queries
 │   │   ├── chains.go            # Chain + chain_nodes queries
-│   │   └── snapshots.go         # Snapshot storage
+│   │   └── audit.go             # Audit log queries
 │   └── ssh/                     # Auto-install 3x-UI
 │       └── installer.go         # SSH + curl install.sh + verify API
 ```
 
-## 5. Data Models (SQLite)
+## 5. Data Models
+
+**Persisted in SQLite (4 tables):** panels, chains, chain_nodes, audit_log — это собственные данные оркестратора.
+**In-memory cache (TTL):** users, snapshots — источник правды это панели, перезапрашиваются при каждом подключении.
 
 ### panels
 | Column | Type | Description |
@@ -139,29 +143,33 @@ github.com/alexeylcp/luc3x-core/
 | config_snapshot | TEXT | JSON — what was created (for rollback) |
 | PK | (chain_id, panel_id, position) | |
 
-### users (local cache)
-| Column | Type | Description |
-|--------|------|-------------|
-| id | TEXT PK | "panel_id:inbound_id:email" |
-| panel_id | TEXT FK→panels | |
-| inbound_id | INTEGER | Inbound ID on the panel |
-| email | TEXT NOT NULL | User identifier |
-| uuid | TEXT | Xray UUID |
-| traffic_up | BIGINT DEFAULT 0 | |
-| traffic_down | BIGINT DEFAULT 0 | |
-| traffic_limit | BIGINT | Bytes, NULL = unlimited |
-| expire_at | DATETIME | NULL = never |
-| status | TEXT DEFAULT 'active' | 'active', 'expired', 'disabled', 'over_limit' |
-| chain_id | TEXT FK→chains | NULL if not bound to a chain |
-| last_synced | DATETIME | |
+### users — in-memory cache (NOT persisted)
 
-### snapshots
-| Column | Type | Description |
-|--------|------|-------------|
-| id | TEXT PK | UUID |
-| panel_id | TEXT FK→panels | |
-| data | TEXT NOT NULL | JSON: { inbounds, outbounds, routing } |
-| taken_at | DATETIME | DEFAULT NOW() |
+Fetched fresh from panels on every connection. Held in memory with TTL. Panels are the source of truth.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| id | string | "panel_id:inbound_id:email" |
+| panel_id | string | |
+| inbound_id | int | Inbound ID on the panel |
+| email | string | User identifier |
+| uuid | string | Xray UUID |
+| traffic_up | int64 | |
+| traffic_down | int64 | |
+| traffic_limit | int64 | Bytes, 0 = unlimited |
+| expire_at | time.Time | Zero = never |
+| status | string | 'active', 'expired', 'disabled', 'over_limit' |
+| chain_id | string | Bound chain, empty if unassigned |
+
+### snapshots — in-memory cache (NOT persisted)
+
+Full panel state (inbounds + outbounds + routing) fetched on-demand for map view. Re-fetched when user opens dashboard or triggers refresh. Used to diff and detect changes.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| panel_id | string | |
+| data | json.RawMessage | { inbounds, outbounds, routing } |
+| taken_at | time.Time | |
 
 ### audit_log
 | Column | Type | Description |

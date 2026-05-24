@@ -175,6 +175,7 @@ Full panel state (inbounds + outbounds + routing) fetched on-demand for map view
 | Column | Type | Description |
 |--------|------|-------------|
 | id | INTEGER PK | AUTOINCREMENT |
+| actor | TEXT NOT NULL | Client IP or client-id who performed the action |
 | action | TEXT NOT NULL | 'chain.apply', 'user.batch_create', etc. |
 | target_type | TEXT | 'chain', 'user', 'panel' |
 | target_id | TEXT | |
@@ -300,7 +301,52 @@ ON ERROR (e.g., step 2b fails):
 | Web (PWA) | v1 | For server-side access |
 | CLI | v2 | Automation/scripting companion |
 
-## 11. Out of Scope for v1
+## 11. Risks & Mitigations
+
+### CRITICAL: 3x-UI Outbound/Routing API
+
+**Risk:** По состоянию на май 2026, API 3x-UI для Outbounds и Routing Rules либо отсутствует, либо сильно ограничен. Inbounds + Clients — зрелые. Но без API для outbounds/routing весь Chain Engine не сможет работать.
+
+**Mitigation (Phase 0 — FIRST THING):**
+1. Поднять тестовую панель 3x-UI, проверить ВСЕ endpoint'ы: inbound CRUD, outbound CRUD, routing CRUD, client CRUD.
+2. Если outbound/routing API нет — проверить endpoint "Update Xray Config" (если есть — использовать его как fallback для записи конфига напрямую).
+3. Если и его нет — форкнуть 3x-UI и добавить недостающие endpoint'ы, либо внести в上游 PR.
+
+**Результат Phase 0:** документ `docs/api-audit.md` с полной картой доступных endpoint'ов и решением по outbound/routing.
+
+### Project Complexity
+
+**Risk:** Go Core + Flutter + WebSocket + Vault + Transaction Engine — это серьёзный объём для одного человека.
+
+**Mitigation — Phased Approach:**
+- **Phase 1 (MVP):** Flutter-only приложение. Прямые вызовы API панелей из клиента. Локальная SQLite (drift) для panels/chains. Никакого Go Core. Транзакции цепочек — optimistic (выполняем последовательно, при ошибке — manual rollback через UI).
+- **Phase 2:** Go Core. Когда продукт показывает жизнь и становится понятно, что Flutter-only недостаточно — выносим оркестрацию в Core.
+
+### Mobile Graph Editor
+
+**Risk:** Drag & drop конструктор цепочек на маленьком экране телефона — неудобно.
+
+**Mitigation:** Два режима конструктора:
+- **Desktop/Tablet:** полноценный граф с drag & drop (canvas).
+- **Mobile:** Wizard mode — шаговый конструктор: "Выбери Entry сервер" → "Выбери протокол" → "Добавить Hop?" → "Выбери Exit сервер" → "Готово".
+
+### SSH Installer
+
+**Risk:** Разные ОС (Debian/Ubuntu/CentOS/AlmaLinux), firewall (ufw/firewalld/iptables/nftables), SELinux, architecture (amd64/arm64).
+
+**Mitigation:**
+- Использовать официальный install.sh от 3x-UI (проверенный).
+- Перед запуском: detect OS + arch, проверить совместимость.
+- После установки: verify API доступен (GET /panel/api/inbounds/list с кредом).
+- При ошибке: сохранить полный лог установки в audit_log.
+
+### Other Adjustments
+
+- **Forced refresh:** в snapshot cache добавить кнопку "Refresh Now" + авто-refresh по таймеру (настраиваемый, default 30s).
+- **Audit Log:** добавить поле `actor` — IP/client-id кто выполнил действие.
+- **Concurrent access:** если несколько клиентов подключены к одному Core — блокировка на apply chain (оптимистическая через version field в БД).
+
+## 12. Out of Scope for v1
 
 - **AmneziaWG (AWG) support** — vanilla 3x-UI API only. AWG panel support in v2.
 - **Telemt (MTProto)** — v2.
@@ -308,7 +354,7 @@ ON ERROR (e.g., step 2b fails):
 - **Subscription link import** — v1 supports URL+login+password; subscription parsing in v2.
 - **Embedded Xray-core** — Luc3X orchestrates, does not proxy traffic itself.
 
-## 12. Tech Stack Summary
+## 13. Tech Stack Summary
 
 | Layer | Technology |
 |-------|-----------|

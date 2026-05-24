@@ -1,0 +1,26 @@
+# LucX License
+
+Copyright (c) 2026 LucX Project
+
+## Terms
+
+**Free for personal and educational use.**
+
+**Commercial use (including VPN resale, VPN-as-a-service, paid proxy/VPN hosting) requires explicit written permission from the author.**
+
+This includes but is not limited to:
+- Selling VPN/proxy access that uses LucX-managed infrastructure
+- Offering LucX as a managed service
+- Bundling LucX with commercial hardware/software products
+- Using LucX orchestration features in a commercial VPN operation
+
+To request commercial use permission, contact the author.
+
+## Full License Text
+
+This project is licensed under the PolyForm Noncommercial License 1.0.0:
+https://polyformproject.org/licenses/noncommercial/1.0.0/
+
+---
+
+SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0

@@ -208,10 +208,11 @@ github.com/alexeylcp/lucx-core/
 │   │   ├── importer.go             # Import existing Xray config into LucX model
 │   │   └── detector.go             # Detect: what proxy software is running?
 │   │
-│   ├── ssh/                        # SSH client pool
+│   ├── ssh/                        # SSH client pool (multi-distro)
 │   │   ├── pool.go                 # Connection pool — one persistent conn per server
 │   │   ├── client.go               # SSH client wrapper (run commands, read/write files)
-│   │   └── keys.go                 # SSH key management (encrypted storage)
+│   │   ├── keys.go                 # SSH key management (encrypted storage + ssh-agent)
+│   │   └── distro.go               # OS detection: Debian/Ubuntu/Alma/Arch, pkg manager, init system
 │   │
 │   ├── store/                      # SQLite data layer
 │   │   ├── db.go                   # Connection, migrations, WAL mode
@@ -269,7 +270,8 @@ github.com/alexeylcp/lucx-core/
 |--------|------|-------------|
 | chain_id | TEXT FK→chains | |
 | server_id | TEXT FK→servers | |
-| backend_type | TEXT NOT NULL | 'xray' (v1), can be mixed in v2 |
+| backend_type | TEXT NOT NULL | 'xray' (v1), mixed per node in v2 (xray→awg→xray) |
+| protocol | TEXT NOT NULL | 'vless', 'vmess', 'trojan', 'wireguard', etc. — per node |
 | position | INTEGER NOT NULL | 0=entry, N=intermediate, last=exit |
 | role | TEXT NOT NULL | 'entry', 'hop', 'exit' |
 | inbound_spec | TEXT | JSON: InboundSpec (what to create) |
@@ -397,6 +399,8 @@ Wizard mode (step-by-step):
 3. Select Exit server → configure
 4. Review summary → Apply
 
+Drafts: chain auto-saved as `draft` on every wizard step. Resume from dashboard. Drafts persist in local SQLite.
+
 ### 10.4 Server Management
 
 Card/table view. Status, SSH info, installed backends, tags.
@@ -411,7 +415,7 @@ Before installing Xray on a server, shows:
 
 ## 11. Security Model
 
-- **SSH credentials:** encrypted at rest (AES-256-GCM, key derived from user password via Argon2id).
+- **SSH credentials:** encrypted at rest (AES-256-GCM, key derived from user password via Argon2id). Advanced users can opt into ssh-agent (no credential storage — LucX delegates auth to the system agent).
 - **No credentials in logs:** SSH passwords/keys never written to logs.
 - **JWT:** Simple token auth for Flutter ↔ Core communication. Single user, no roles.
 - **TLS:** Core serves HTTPS. Self-signed cert auto-generated, user can provide custom cert.
@@ -428,13 +432,33 @@ Before installing Xray on a server, shows:
 | iOS | ✓ (wizard mode for chain builder) |
 | Web (PWA) | ✓ |
 
-## 13. Development Phases
+## 13. Risks & Mitigations
+
+| Risk | Severity | Mitigation |
+|------|----------|------------|
+| gRPC HandlerService fails with Reality + uTLS + fallback configs | HIGH | Phase 0 tests this first. Fallback: config-file strategy for Reality chains. |
+| gRPC requires Xray restart for certain settings (streamSettings changes) | MEDIUM | Phase 0 identifies which settings need restart. Document as known limitation. |
+| Multi-distro SSH installer (apt/dnf/pacman, systemd/openrc, paths differ) | MEDIUM | Dedicated `distro.go` — detect OS/init/pkg-manager before install. Test on top 5 distros in MVP. |
+| Xray version incompatibility (config format changes between 1.8.x versions) | LOW | Pin tested Xray version. Installer downloads specific version, not "latest". Auto-update in v2. |
+| User has existing production Xray — LucX overwrites config | HIGH | Pre-flight scanner MUST detect before install. Import mode for standalone Xray. Never overwrite without explicit user approval. |
+| SSH connection drops during chain apply | MEDIUM | Transaction engine: each step must succeed before next. Rollback on any failure. SSH pool with retry (3 attempts). |
+
+## 14. Development Phases
 
 ### Phase 0 — API Verification (1-2 days)
 
-- Deploy test Xray instance, verify gRPC HandlerService API works for AddInbound/AddOutbound/RemoveInbound.
-- Verify config file format compatibility.
-- Document findings in `docs/api-audit.md`.
+**Critical path — must verify before any code:**
+
+1. Deploy test Xray 1.8.x+ instance, enable gRPC HandlerService.
+2. Test AddInbound with VLESS+Reality+uTLS fingerprint+fallback — verify it works without Xray restart.
+3. Test AddOutbound with same parameters.
+4. Test AddRoutingRule — verify routing is applied correctly.
+5. Test RemoveInbound/RemoveOutbound — verify cleanup.
+6. Test config.json fallback path: write complex config, restart Xray, verify handshake works.
+7. Document findings in `docs/api-audit.md`.
+8. If gRPC is flaky with Reality+uTLS: document exact limitations, plan fallback strategy.
+
+**Go/No-Go:** If gRPC API cannot handle Reality+uTLS configurations, v1 will use config-file strategy exclusively for Reality chains.
 
 ### Phase 1 — MVP (4-6 weeks)
 
@@ -471,7 +495,7 @@ Before installing Xray on a server, shows:
 - Mixed-protocol chains (Xray → AWG → Xray)
 - Subscription link import
 
-## 14. Tech Stack
+## 15. Tech Stack
 
 | Layer | Technology |
 |-------|-----------|
